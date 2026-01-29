@@ -6,76 +6,104 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-// Create the MCP Server
+const ENABLE_SELF_HEALING = process.env.ENABLE_SELF_HEALING === 'true';
+const RETRY_LIMIT = parseInt(process.env.RETRY_LIMIT || '3');
+
+async function getStableConnection(): Promise<oracledb.Connection> {
+    let attempts = 0;
+    while (attempts < RETRY_LIMIT) {
+        try {
+            return await oracledb.getConnection({
+                user: process.env.DB_USER,
+                password: process.env.DB_PASSWORD,
+                connectString: process.env.DB_CONNECTION_STRING
+            });
+        } catch (err: any) {
+            attempts++;
+            console.error(`[DB-RETRY] Attempt ${attempts}/${RETRY_LIMIT} failed: ${err.message}`);
+            if (!ENABLE_SELF_HEALING || attempts >= RETRY_LIMIT) throw err;
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+    }
+    throw new Error("Failed to connect to Oracle after retries.");
+}
+
 const server = new Server(
-  { name: "qualigenai-oracle-bridge", version: "1.0.0" },
-  { capabilities: { tools: {} } }
+    { name: "qualigenai-oracle-bridge", version: "1.1.0" }, 
+    { capabilities: { tools: {} } }
 );
 
-// Register the tools for the AI
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: "list_oracle_tables",
-      description: "Lists all tables in the Oracle database to understand the data structure.",
-      inputSchema: { type: "object", properties: {} }
-    },
-    {
-      name: "execute_query",
-      description: "Execute any SQL command (CREATE, INSERT, SELECT, UPDATE, DELETE) on the Oracle database.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          sql: { type: "string", description: "The full SQL query to execute" }
+    tools: [
+        {
+            name: "list_oracle_tables",
+            description: "Lists all tables in the Oracle database.",
+            inputSchema: { type: "object", properties: {} }
         },
-        required: ["sql"]
-      }
-    }
-  ]
+        {
+            name: "execute_query",
+            description: "Execute any SQL command.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    sql: { type: "string", description: "The full SQL query" }
+                },
+                required: ["sql"]
+            }
+        }
+    ]
 }));
 
-// Handle the AI's request to use the tools
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+    const { name, arguments: args } = request.params;
+    let conn: oracledb.Connection | undefined;
 
-  let conn;
-  try {
-    conn = await oracledb.getConnection({
-      user: process.env.DB_USER,
-      password: process.env.DB_PASSWORD,
-      connectString: process.env.DB_CONNECTION_STRING
-    });
+    try {
+        conn = await getStableConnection();
 
-    if (name === "list_oracle_tables") {
-      const result = await conn.execute("SELECT table_name FROM user_tables");
-      return { content: [{ type: "text", text: JSON.stringify(result.rows) }] };
+        if (name === "list_oracle_tables" && conn) {
+            const result = await conn.execute("SELECT table_name FROM user_tables");
+            return { content: [{ type: "text", text: JSON.stringify(result.rows) }] };
+        }
+
+        if (name === "execute_query" && conn) {
+            const sql = (args as { sql: string }).sql;
+            try {
+                const result = await conn.execute(sql, [], { autoCommit: true });
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify(result.rows || { 
+                            message: "Command executed successfully", 
+                            rowsAffected: result.rowsAffected 
+                        })
+                    }]
+                };
+            } catch (sqlErr: any) {
+                let advice = "";
+                if (sqlErr.message.includes("ORA-00942")) {
+                    advice = " TIP: Table not found. Try list_oracle_tables.";
+                } else if (sqlErr.message.includes("ORA-00904")) {
+                    advice = " TIP: Invalid column name.";
+                }
+                return {
+                    content: [{ type: "text", text: `Oracle SQL Error: ${sqlErr.message}.${advice}` }],
+                    isError: true
+                };
+            }
+        }
+        throw new Error(`Tool not found: ${name}`);
+    } catch (err: any) {
+        return {
+            content: [{ type: "text", text: `Error: ${err.message}` }],
+            isError: true
+        };
+    } finally {
+        if (conn) {
+            try { await conn.close(); } catch (e) { console.error("Close error", e); }
+        }
     }
-
-    if (name === "execute_query") {
-      const sql = (args as any).sql;
-      // autoCommit is essential for DDL and DML operations to persist
-      const result = await conn.execute(sql, [], { autoCommit: true });
-      
-      return { 
-        content: [{ 
-          type: "text", 
-          text: JSON.stringify(result.rows || { message: "Command executed successfully", rowsAffected: result.rowsAffected }) 
-        }] 
-      };
-    }
-
-    throw new Error(`Tool not found: ${name}`);
-
-  } catch (err: any) {
-    return { 
-      content: [{ type: "text", text: `Oracle Error: ${err.message}` }], 
-      isError: true 
-    };
-  } finally {
-    if (conn) await conn.close();
-  }
 });
 
-// Start the bridge
 const transport = new StdioServerTransport();
 await server.connect(transport);
